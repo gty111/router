@@ -30,7 +30,12 @@ mod test_pd_routing {
             let hash = body["messages"][0]["content"][0]["uuid"].as_str().unwrap();
             Json(json!({
                 "ec_transfer_params": {
-                    (hash): {"metadata": {"image_grid_thw": [[1, 2, 3]]}},
+                    (format!("engine-{hash}")): {
+                        "metadata": {"image_grid_thw": [[1, 2, 3]]},
+                        "peer_host": "encoder",
+                        "peer_port": 4321,
+                        "size_bytes": 128,
+                    },
                 },
             }))
             .into_response()
@@ -175,6 +180,11 @@ mod test_pd_routing {
             assert_eq!(p["max_tokens"], 1);
             assert_eq!(p["stream"], false);
             assert!(p["ec_transfer_params"]["ec_items"].is_array());
+            let uuid = p["messages"][0]["content"][0]["uuid"].as_str().unwrap();
+            let hash = format!("engine-{uuid}");
+            assert_eq!(p["ec_transfer_params"]["ec_items"][0]["mm_hash"], hash);
+            assert_eq!(p["ec_transfer_params"][&hash]["peer_port"], 4321);
+            assert!(p["ec_transfer_params"].get(uuid).is_none());
             assert_eq!(
                 p["messages"][0]["content"][0]["image_embeds"]["image_grid_thw"],
                 json!([1, 2, 3])

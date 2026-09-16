@@ -56,30 +56,54 @@ impl Drop for EcTransferGuard {
         let control_addr = self.control_addr.clone();
         // No blocking ZMQ operations on the HTTP runtime threads.
         tokio::task::spawn_blocking(move || {
-            let context = zmq::Context::new();
-            for transfer_id in transfer_ids {
-                let result = (|| -> Result<(), zmq::Error> {
-                    let socket = context.socket(zmq::REQ)?;
-                    socket.set_linger(0)?;
-                    socket.set_sndtimeo(1000)?;
-                    socket.set_rcvtimeo(1000)?;
-                    socket.connect(&control_addr)?;
-                    let body = json!({
-                        "op": "cancel",
-                        "transfer_id": transfer_id,
-                        "abandon": true,
-                    })
-                    .to_string();
-                    socket.send(body.as_bytes(), 0)?;
-                    socket.recv_bytes(0)?;
-                    Ok(())
-                })();
-                if let Err(error) = result {
-                    tracing::warn!(%error, "Could not cancel abandoned EC transfer");
-                }
+            if let Err(error) = cancel_ec_transfers(&control_addr, &transfer_ids) {
+                tracing::warn!(%error, %control_addr, "Could not discover EC consumer shards for cancellation");
             }
         });
     }
+}
+
+fn ec_control_request(
+    context: &zmq::Context,
+    address: &str,
+    request: &Value,
+) -> anyhow::Result<Value> {
+    let socket = context.socket(zmq::REQ)?;
+    socket.set_linger(0)?;
+    socket.set_sndtimeo(1000)?;
+    socket.set_rcvtimeo(1000)?;
+    socket.connect(address)?;
+    socket.send(serde_json::to_vec(request)?.as_slice(), 0)?;
+    let mut response: Value = serde_json::from_slice(&socket.recv_bytes(0)?)?;
+    anyhow::ensure!(
+        response["ok"] == true,
+        "EC control request failed: {}",
+        response["error"]
+    );
+    Ok(response["result"].take())
+}
+
+fn cancel_ec_transfers(control_addr: &str, transfer_ids: &[String]) -> anyhow::Result<()> {
+    let context = zmq::Context::new();
+    let peers = ec_control_request(&context, control_addr, &json!({"op": "peers"}))?;
+    let ports: Vec<u16> = serde_json::from_value(peers["ports"].clone())?;
+    anyhow::ensure!(
+        !ports.is_empty() && !ports.contains(&0),
+        "Invalid EC consumer shard ports"
+    );
+    let (prefix, _) = control_addr
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("Invalid EC control address: {control_addr}"))?;
+    for port in ports {
+        let address = format!("{prefix}:{port}");
+        for transfer_id in transfer_ids {
+            let request = json!({"op": "cancel", "transfer_id": transfer_id, "abandon": true});
+            if let Err(error) = ec_control_request(&context, &address, &request) {
+                tracing::warn!(%error, %address, %transfer_id, "Could not cancel abandoned EC transfer");
+            }
+        }
+    }
+    Ok(())
 }
 
 impl EncoderStage {
@@ -160,44 +184,47 @@ impl EncoderStage {
             let Some((hash, reported)) = entry else {
                 continue;
             };
-            let Some(metadata) = reported
+            if let Some(metadata) = reported
                 .get("metadata")
                 .and_then(Value::as_object)
                 .filter(|m| !m.is_empty())
-            else {
-                continue;
-            };
-            let metadata = flatten_metadata(metadata)?;
-            let kind = match item.kind {
-                "image_url" => "image_embeds",
-                "video_url" => "video_embeds",
-                _ => "audio_embeds",
-            };
-            body["messages"][item.message_index]["content"][item.content_index] = json!({
-                "type": kind,
-                (kind): metadata,
-                "uuid": item.content_id,
-            });
-            handles.insert(item.content_id.clone(), reported);
-            transfers.push(json!({
-                "mm_hash": hash,
-                "transfer_id": item.transfer_id,
-            }));
-            used_transfer_ids.push(item.transfer_id.clone());
+            {
+                let metadata = flatten_metadata(metadata)?;
+                let kind = match item.kind {
+                    "image_url" => "image_embeds",
+                    "video_url" => "video_embeds",
+                    _ => "audio_embeds",
+                };
+                body["messages"][item.message_index]["content"][item.content_index] = json!({
+                    "type": kind,
+                    (kind): metadata,
+                    "uuid": item.content_id,
+                });
+                transfers.push(json!({
+                    "mm_hash": hash,
+                    "transfer_id": item.transfer_id,
+                }));
+                used_transfer_ids.push(item.transfer_id.clone());
+            }
+            handles.insert(hash, reported);
         }
         let rewritten = transfers.len();
-        if rewritten > 0 {
+        if !handles.is_empty() {
             if let Some(Value::Object(mut existing)) =
                 body.get_mut("ec_transfer_params").map(Value::take)
             {
-                if let Some(Value::Array(mut previous)) = existing.remove("ec_items") {
-                    previous.append(&mut transfers);
-                    transfers = previous;
+                if !transfers.is_empty() {
+                    if let Some(Value::Array(mut previous)) = existing.remove("ec_items") {
+                        previous.append(&mut transfers);
+                        transfers = previous;
+                    }
                 }
                 existing.extend(handles);
                 handles = existing;
             }
-            handles.insert("ec_items".into(), Value::Array(transfers));
+            if !transfers.is_empty() {
+                handles.insert("ec_items".into(), Value::Array(transfers));
+            }
             body["ec_transfer_params"] = Value::Object(handles);
         }
         if let Some(pending) = pending.as_mut() {
@@ -454,9 +481,12 @@ mod tests {
             format!("engine-{}", content[0]["uuid"].as_str().unwrap())
         );
         assert_eq!(
-            body["ec_transfer_params"][content[0]["uuid"].as_str().unwrap()]["peer_port"],
+            body["ec_transfer_params"][transfers[1]["mm_hash"].as_str().unwrap()]["peer_port"],
             4321
         );
+        assert!(body["ec_transfer_params"]
+            .get(content[0]["uuid"].as_str().unwrap())
+            .is_none());
         assert_eq!(body["stream"], true);
         assert_eq!(body["chat_template_kwargs"], input["chat_template_kwargs"]);
         let requests = seen.lock().unwrap();
@@ -472,15 +502,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_metadata_preserves_original_media() {
-        let (stage, _, server) = mock("empty").await;
+    async fn missing_metadata_preserves_media_and_remote_handles() {
+        let (stage, seen, server) = mock("empty").await;
         let mut input = request();
-        input["ec_transfer_params"] = json!({"opaque": {"backend_field": 42}});
+        input["ec_transfer_params"] = json!({
+            "opaque": {"backend_field": 42},
+            "ec_items": [{"mm_hash": "existing", "transfer_id": "existing-transfer"}],
+        });
         let (body, _) = stage
             .prepare(&Client::new(), input.clone(), "pd", None, None)
             .await
             .unwrap();
-        assert_eq!(body, input);
+        assert_eq!(body["messages"], input["messages"]);
+        for key in ["opaque", "ec_items"] {
+            assert_eq!(
+                body["ec_transfer_params"][key],
+                input["ec_transfer_params"][key]
+            );
+        }
+        let seen = seen.lock().unwrap();
+        let uuid = seen[0]["messages"][0]["content"][0]["uuid"]
+            .as_str()
+            .unwrap();
+        let handle = &body["ec_transfer_params"][format!("engine-{uuid}")];
+        assert_eq!(handle["metadata"], json!({}));
+        assert_eq!(handle["peer_port"], 4321);
         server.abort();
     }
 
@@ -519,26 +565,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abandoned_pushes_cancel_the_selected_consumer() {
-        for mode in ["normal", "empty", "mixed", "invalid", "fail"] {
+    async fn abandoned_pushes_cancel_all_consumer_shards() {
+        for mode in [
+            "normal",
+            "empty",
+            "mixed",
+            "invalid",
+            "fail",
+            "cancel_error",
+        ] {
             let (mut stage, seen, server) = mock(mode).await;
             let (send_address, recv_address) = tokio::sync::oneshot::channel();
             let control = tokio::task::spawn_blocking(move || {
                 let context = zmq::Context::new();
-                let socket = context.socket(zmq::REP).unwrap();
-                socket.set_rcvtimeo(5000).unwrap();
-                socket.set_linger(0).unwrap();
-                socket.bind("tcp://127.0.0.1:*").unwrap();
-                send_address
-                    .send(socket.get_last_endpoint().unwrap().unwrap())
+                let sockets = [0, 1].map(|_| {
+                    let socket = context.socket(zmq::REP).unwrap();
+                    socket.set_rcvtimeo(5000).unwrap();
+                    socket.set_sndtimeo(5000).unwrap();
+                    socket.set_linger(0).unwrap();
+                    socket.bind("tcp://127.0.0.1:*").unwrap();
+                    socket
+                });
+                let addresses = sockets
+                    .each_ref()
+                    .map(|s| s.get_last_endpoint().unwrap().unwrap());
+                let ports = addresses
+                    .each_ref()
+                    .map(|a| a.rsplit_once(':').unwrap().1.parse::<u16>().unwrap());
+                send_address.send(addresses[0].clone()).unwrap();
+                let discovery: Value =
+                    serde_json::from_slice(&sockets[0].recv_bytes(0).unwrap()).unwrap();
+                assert_eq!(discovery, json!({"op": "peers"}));
+                sockets[0]
+                    .send(
+                        json!({"ok": true, "result": {"ports": ports}})
+                            .to_string()
+                            .as_bytes(),
+                        0,
+                    )
                     .unwrap();
-                let mut cancelled = Vec::new();
+                let mut cancelled = [Vec::new(), Vec::new()];
                 let expected = if mode == "mixed" { 1 } else { 2 };
-                for _ in 0..expected {
-                    let message: Value =
-                        serde_json::from_slice(&socket.recv_bytes(0).unwrap()).unwrap();
-                    cancelled.push(message);
-                    socket.send(b"{\"ok\":true}".as_slice(), 0).unwrap();
+                for (rank, socket) in sockets.iter().enumerate() {
+                    for _ in 0..expected {
+                        let message: Value =
+                            serde_json::from_slice(&socket.recv_bytes(0).unwrap()).unwrap();
+                        cancelled[rank].push(message);
+                        let response = if mode == "cancel_error" && rank == 0 {
+                            json!({"ok": false, "error": "injected failure"})
+                        } else {
+                            json!({"ok": true, "result": {"cancelled": true}})
+                        };
+                        socket.send(response.to_string().as_bytes(), 0).unwrap();
+                    }
                 }
                 cancelled
             });
@@ -571,15 +650,42 @@ mod tests {
                 drop(pending);
             }
             let cancelled = control.await.unwrap();
-            assert!(cancelled.iter().all(|r| r["op"] == "cancel"
+            assert_eq!(cancelled[0], cancelled[1]);
+            assert!(cancelled[0].iter().all(|r| r["op"] == "cancel"
                 && r["abandon"] == true
                 && ids.contains(&r["transfer_id"])));
             if mode == "mixed" {
-                assert_eq!(cancelled[0]["transfer_id"], ids[0]);
+                assert_eq!(cancelled[0][0]["transfer_id"], ids[0]);
             } else {
-                assert_ne!(cancelled[0]["transfer_id"], cancelled[1]["transfer_id"]);
+                assert_ne!(
+                    cancelled[0][0]["transfer_id"],
+                    cancelled[0][1]["transfer_id"]
+                );
             }
             server.abort();
         }
+    }
+
+    #[test]
+    fn control_request_rejects_remote_errors() {
+        let context = zmq::Context::new();
+        let socket = context.socket(zmq::REP).unwrap();
+        socket.set_rcvtimeo(5000).unwrap();
+        socket.set_sndtimeo(5000).unwrap();
+        socket.set_linger(0).unwrap();
+        socket.bind("tcp://127.0.0.1:*").unwrap();
+        let address = socket.get_last_endpoint().unwrap().unwrap();
+        let server = std::thread::spawn(move || {
+            socket.recv_bytes(0).unwrap();
+            socket
+                .send(
+                    b"{\"ok\":false,\"error\":\"injected failure\"}".as_slice(),
+                    0,
+                )
+                .unwrap();
+        });
+        let result = ec_control_request(&context, &address, &json!({"op": "peers"}));
+        server.join().unwrap();
+        assert!(result.unwrap_err().to_string().contains("injected failure"));
     }
 }
