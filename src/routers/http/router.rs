@@ -1682,7 +1682,13 @@ impl RouterTrait for Router {
         }
 
         let policy = self.policy_registry.get_default_policy();
-        let request_text = serde_json::to_string(&body).ok();
+        // Serializing the whole body is expensive when it carries base64
+        // media; only policies that actually read the text pay for it.
+        let request_text = if policy.needs_request_text() {
+            serde_json::to_string(&body).ok()
+        } else {
+            None
+        };
         let request_headers = Self::headers_to_request_headers(headers);
         let worker_idx = match policy.select_worker_with_headers(
             &workers,

@@ -28,8 +28,9 @@ target/release/vllm-router \
 `consumer_zmq_addrs` is for Mooncake PUSH and must map each configured PD HTTP URL
 to that worker's configured EC control address. For NIXL PULL or the shared-file
 example connector, omit this map. The PD worker is selected before encoding so
-the producer and the HTTP request use the same destination. Encoder requests
-are distributed round-robin per media item.
+the producer and the HTTP request use the same destination. Media items are
+assigned to encoders round-robin; images landing on the same encoder are
+batched into a single request, like the Python EPD proxy.
 
 Send ordinary OpenAI chat requests to `/v1/chat/completions`. Each raw media item
 is sent to an encoder. Published metadata replaces that item with an embeds

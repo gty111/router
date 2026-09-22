@@ -4,6 +4,7 @@ use futures_util::future::join_all;
 use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use uuid::Uuid;
@@ -144,9 +145,27 @@ impl EncoderStage {
             .map(str::to_owned)
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let start = self.next_encoder.fetch_add(items.len(), Ordering::Relaxed);
-        let replies = join_all(items.iter().enumerate().map(|(index, item)| {
-            let encoder_url = &self.config.encoder_urls
-                [start.wrapping_add(index) % self.config.encoder_urls.len()];
+        // Round-robin per item, then batch the images of one request that land
+        // on the same encoder into a single call, like the Python EPD proxy.
+        // Audio and video items stay singleton groups.
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut image_group_of: HashMap<usize, usize> = HashMap::new();
+        for (index, item) in items.iter().enumerate() {
+            let encoder = start.wrapping_add(index) % self.config.encoder_urls.len();
+            if item.kind == "image_url" {
+                match image_group_of.get(&encoder) {
+                    Some(&group) => groups[group].1.push(index),
+                    None => {
+                        image_group_of.insert(encoder, groups.len());
+                        groups.push((encoder, vec![index]));
+                    }
+                }
+            } else {
+                groups.push((encoder, vec![index]));
+            }
+        }
+        let replies = join_all(groups.iter().map(|(encoder, indices)| {
+            let encoder_url = &self.config.encoder_urls[*encoder];
             let mut request = client
                 .post(format!(
                     "{}/v1/chat/completions",
@@ -154,14 +173,23 @@ impl EncoderStage {
                 ))
                 .header(
                     "x-request-id",
-                    format!("{request_id}:{index}:{}", item.transfer_id),
+                    format!(
+                        "{request_id}:{}:{:.6}",
+                        indices[0], items[indices[0]].transfer_id
+                    ),
                 );
             if let Some(key) = api_key {
                 request = request.bearer_auth(key);
             } else if let Some(auth) = headers.and_then(|h| h.get("authorization")) {
                 request = request.header("authorization", auth);
             }
-            encode_item(request, item, &body, consumer_addr.map(String::as_str))
+            encode_group(
+                request,
+                &items,
+                indices,
+                &body,
+                consumer_addr.map(String::as_str),
+            )
         }))
         .await;
         let replies: Vec<Value> = replies.into_iter().collect::<Result<_, _>>()?;
@@ -169,65 +197,110 @@ impl EncoderStage {
         let mut transfers = Vec::new();
         let mut used_transfer_ids = Vec::new();
         let mut rewritten = 0;
-        for (item, mut reply) in items.iter().zip(replies) {
-            let Some(Value::Object(mut params)) =
-                reply.get_mut("ec_transfer_params").map(Value::take)
+        for ((_, indices), mut reply) in groups.iter().zip(replies) {
+            let Some(Value::Object(params)) = reply.get_mut("ec_transfer_params").map(Value::take)
             else {
                 // No EC report at all: keep the raw media but pin its uuid so
                 // the consumer derives the same mm_hash the encoder used.
-                body["messages"][item.message_index]["content"][item.content_index] =
-                    item.media.clone();
+                for &index in indices {
+                    let item = &items[index];
+                    body["messages"][item.message_index]["content"][item.content_index] =
+                        item.media.clone();
+                }
                 continue;
             };
-            let entry = if let Some(reported) = params.remove(&item.content_id) {
-                Some((item.content_id.clone(), reported))
-            } else if params.len() == 1 {
-                params.into_iter().next()
-            } else {
-                None
-            };
-            let Some((hash, reported)) = entry else {
-                body["messages"][item.message_index]["content"][item.content_index] =
-                    item.media.clone();
-                continue;
-            };
-            if let Some(metadata) = reported
-                .get("metadata")
-                .and_then(Value::as_object)
-                .filter(|m| !m.is_empty())
-            {
-                let metadata = flatten_metadata(metadata)?;
-                let kind = match item.kind {
-                    "image_url" => "image_embeds",
-                    "video_url" => "video_embeds",
-                    _ => "audio_embeds",
-                };
-                body["messages"][item.message_index]["content"][item.content_index] = json!({
-                    "type": kind,
-                    (kind): metadata,
-                    "uuid": item.content_id,
-                });
-                transfers.push(json!({
-                    "mm_hash": hash,
-                    "transfer_id": item.transfer_id,
-                }));
-                used_transfer_ids.push(item.transfer_id.clone());
-                rewritten += 1;
-            } else {
-                // The encoder reported no placeholder metadata (e.g. a
-                // processor cache hit): keep the raw media with its uuid
-                // pinned and hand the transfer to the consumer, which can
-                // then reuse the published embedding after re-preprocessing
-                // instead of abandoning the transfer.
-                body["messages"][item.message_index]["content"][item.content_index] =
-                    item.media.clone();
-                transfers.push(json!({
-                    "mm_hash": hash,
-                    "transfer_id": item.transfer_id,
-                }));
-                used_transfer_ids.push(item.transfer_id.clone());
+            // Position is the reliable correlation when the engine rehashes
+            // uuids with processing options; the uuid key and the single-entry
+            // shape are fallbacks for encoders without position metadata.
+            let mut by_position: HashMap<usize, (&String, &Value)> = HashMap::new();
+            if indices.len() > 1 {
+                for (mm_hash, reported) in params.iter() {
+                    if let Some(item_indices) =
+                        reported.get("item_indices").and_then(Value::as_array)
+                    {
+                        for local in item_indices {
+                            let local = local
+                                .as_u64()
+                                .map(|v| v as usize)
+                                .filter(|&v| v < indices.len())
+                                .ok_or_else(|| {
+                                    (StatusCode::BAD_GATEWAY, "Invalid encoder item index".into())
+                                })?;
+                            if by_position.insert(local, (mm_hash, reported)).is_some() {
+                                return Err((
+                                    StatusCode::BAD_GATEWAY,
+                                    "Duplicate encoder item index".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
             }
-            handles.insert(hash, reported);
+            for (local, &index) in indices.iter().enumerate() {
+                let item = &items[index];
+                let entry = by_position
+                    .get(&local)
+                    .map(|(hash, reported)| ((*hash).clone(), (*reported).clone()))
+                    .or_else(|| {
+                        params
+                            .get_key_value(&item.content_id)
+                            .map(|(hash, reported)| (hash.clone(), reported.clone()))
+                    })
+                    .or_else(|| {
+                        if indices.len() == 1 && params.len() == 1 {
+                            params
+                                .iter()
+                                .next()
+                                .map(|(hash, reported)| (hash.clone(), reported.clone()))
+                        } else {
+                            None
+                        }
+                    });
+                let Some((hash, reported)) = entry else {
+                    // Unreported item (e.g. an encoder-side processor cache
+                    // hit): keep the raw media with its uuid pinned.
+                    body["messages"][item.message_index]["content"][item.content_index] =
+                        item.media.clone();
+                    continue;
+                };
+                if let Some(metadata) = reported
+                    .get("metadata")
+                    .and_then(Value::as_object)
+                    .filter(|m| !m.is_empty())
+                {
+                    let metadata = flatten_metadata(metadata)?;
+                    let kind = match item.kind {
+                        "image_url" => "image_embeds",
+                        "video_url" => "video_embeds",
+                        _ => "audio_embeds",
+                    };
+                    body["messages"][item.message_index]["content"][item.content_index] = json!({
+                        "type": kind,
+                        (kind): metadata,
+                        "uuid": item.content_id,
+                    });
+                    transfers.push(json!({
+                        "mm_hash": hash,
+                        "transfer_id": item.transfer_id,
+                    }));
+                    used_transfer_ids.push(item.transfer_id.clone());
+                    rewritten += 1;
+                } else {
+                    // The encoder reported no placeholder metadata (e.g. a
+                    // processor cache hit): keep the raw media with its uuid
+                    // pinned and hand the transfer to the consumer, which can
+                    // then reuse the published embedding after re-preprocessing
+                    // instead of abandoning the transfer.
+                    body["messages"][item.message_index]["content"][item.content_index] =
+                        item.media.clone();
+                    transfers.push(json!({
+                        "mm_hash": hash,
+                        "transfer_id": item.transfer_id,
+                    }));
+                    used_transfer_ids.push(item.transfer_id.clone());
+                }
+                handles.insert(hash, reported);
+            }
         }
         if !handles.is_empty() {
             if let Some(Value::Object(mut existing)) =
@@ -304,19 +377,28 @@ fn collect_media_items(body: &Value) -> Result<Vec<MediaItem>, EpdError> {
     Ok(items)
 }
 
-async fn encode_item(
+async fn encode_group(
     request: RequestBuilder,
-    item: &MediaItem,
+    items: &[MediaItem],
+    indices: &[usize],
     body: &Value,
     consumer_addr: Option<&str>,
 ) -> Result<Value, EpdError> {
     let mut payload = json!({
         "model": body.get("model"),
         "stream": false,
-        "messages": [{"role": "user", "content": [item.media]}],
+        "messages": [{
+            "role": "user",
+            "content": indices.iter().map(|&i| items[i].media.clone()).collect::<Vec<_>>(),
+        }],
     });
     // Per-request preprocessing options must agree on both sides.
-    for key in ["mm_processor_kwargs", "media_io_kwargs"] {
+    for key in [
+        "mm_processor_kwargs",
+        "media_io_kwargs",
+        "priority",
+        "session_id",
+    ] {
         if let Some(value) = body.get(key) {
             payload[key] = value.clone();
         }
@@ -324,7 +406,10 @@ async fn encode_item(
     if let Some(control_addr) = consumer_addr {
         payload["ec_transfer_params"] = json!({
             "consumer_zmq": control_addr,
-            "ec_items": [{"transfer_id": item.transfer_id}],
+            "ec_items": indices
+                .iter()
+                .map(|&i| json!({"transfer_id": items[i].transfer_id}))
+                .collect::<Vec<_>>(),
         });
     }
     let request = request.json(&payload);
@@ -390,38 +475,54 @@ mod tests {
         State(state): State<MockEncoder>,
         Json(body): Json<Value>,
     ) -> (StatusCode, Json<Value>) {
-        let count = {
+        {
             let mut seen = state.seen.lock().unwrap();
             seen.push(body.clone());
-            seen.len()
-        };
+        }
         if state.mode == "fail" {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error":"unavailable"})),
             );
         }
-        let uuid = body["messages"][0]["content"][0]["uuid"].as_str().unwrap();
-        let metadata = if state.mode == "empty" || (state.mode == "mixed" && count == 1) {
-            json!({})
-        } else if state.mode == "invalid" {
-            json!({"image_grid_thw": ["invalid"]})
-        } else {
-            json!({"image_grid_thw":[[1,2,3]]})
-        };
-        (
-            StatusCode::OK,
-            Json(json!({
-                "ec_transfer_params": {
-                    (format!("engine-{uuid}")): {
-                        "metadata": metadata,
-                        "peer_host": "encoder",
-                        "peer_port": 4321,
-                        "size_bytes": 128,
-                    },
-                },
-            })),
-        )
+        // Batched requests carry several media parts; dedupe identical media
+        // into one entry and report positions via item_indices, like vLLM.
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        let mut positions: Vec<(String, Vec<usize>)> = Vec::new();
+        for (index, part) in content.iter().enumerate() {
+            let uuid = part["uuid"].as_str().unwrap().to_owned();
+            match positions.iter_mut().find(|(u, _)| *u == uuid) {
+                Some((_, indices)) => indices.push(index),
+                None => positions.push((uuid, vec![index])),
+            }
+        }
+        let mut params = Map::new();
+        for (uuid, mut indices) in positions {
+            if state.mode == "mixed" {
+                // Report only the later item of a batch, leaving the first
+                // unreported (e.g. an encoder-side processor cache hit).
+                indices = indices.into_iter().skip(1).collect();
+            }
+            if indices.is_empty() {
+                continue;
+            }
+            let metadata = match state.mode {
+                "empty" => json!({}),
+                "invalid" => json!({"image_grid_thw": ["invalid"]}),
+                _ => json!({"image_grid_thw": [[1, 2, 3]]}),
+            };
+            params.insert(
+                format!("engine-{uuid}"),
+                json!({
+                    "metadata": metadata,
+                    "item_indices": indices,
+                    "peer_host": "encoder",
+                    "peer_port": 4321,
+                    "size_bytes": 128,
+                }),
+            );
+        }
+        (StatusCode::OK, Json(json!({"ec_transfer_params": params})))
     }
 
     async fn mock(
@@ -510,14 +611,15 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["chat_template_kwargs"], input["chat_template_kwargs"]);
         let requests = seen.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(requests
-            .iter()
-            .all(|r| r["stream"] == false && r.get("max_tokens").is_none()));
-        assert_eq!(
-            requests[0]["mm_processor_kwargs"],
-            input["mm_processor_kwargs"]
-        );
+        // Both images round-robin onto the single encoder and are batched
+        // into one request.
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(request["stream"] == false && request.get("max_tokens").is_none());
+        assert_eq!(request["mm_processor_kwargs"], input["mm_processor_kwargs"]);
+        let sent = request["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|part| part["uuid"].is_string()));
         server.abort();
     }
 
@@ -626,35 +728,32 @@ mod tests {
                     .each_ref()
                     .map(|a| a.rsplit_once(':').unwrap().1.parse::<u16>().unwrap());
                 send_address.send(addresses[0].clone()).unwrap();
+                let discovery: Value =
+                    serde_json::from_slice(&sockets[0].recv_bytes(0).unwrap()).unwrap();
+                assert_eq!(discovery, json!({"op": "peers"}));
+                sockets[0]
+                    .send(
+                        json!({"ok": true, "result": {"ports": ports}})
+                            .to_string()
+                            .as_bytes(),
+                        0,
+                    )
+                    .unwrap();
                 let mut cancelled = [Vec::new(), Vec::new()];
-                // "mixed" consumes both transfers (one rewritten, one raw
-                // fallback) and is disarmed below, so nothing is abandoned
-                // and no control request is made at all.
-                let expected = if mode == "mixed" { 0 } else { 2 };
-                if expected > 0 {
-                    let discovery: Value =
-                        serde_json::from_slice(&sockets[0].recv_bytes(0).unwrap()).unwrap();
-                    assert_eq!(discovery, json!({"op": "peers"}));
-                    sockets[0]
-                        .send(
-                            json!({"ok": true, "result": {"ports": ports}})
-                                .to_string()
-                                .as_bytes(),
-                            0,
-                        )
-                        .unwrap();
-                    for (rank, socket) in sockets.iter().enumerate() {
-                        for _ in 0..expected {
-                            let message: Value =
-                                serde_json::from_slice(&socket.recv_bytes(0).unwrap()).unwrap();
-                            cancelled[rank].push(message);
-                            let response = if mode == "cancel_error" && rank == 0 {
-                                json!({"ok": false, "error": "injected failure"})
-                            } else {
-                                json!({"ok": true, "result": {"cancelled": true}})
-                            };
-                            socket.send(response.to_string().as_bytes(), 0).unwrap();
-                        }
+                // "mixed" leaves the unreported item's transfer abandoned while
+                // the reported one is disarmed below.
+                let expected = if mode == "mixed" { 1 } else { 2 };
+                for (rank, socket) in sockets.iter().enumerate() {
+                    for _ in 0..expected {
+                        let message: Value =
+                            serde_json::from_slice(&socket.recv_bytes(0).unwrap()).unwrap();
+                        cancelled[rank].push(message);
+                        let response = if mode == "cancel_error" && rank == 0 {
+                            json!({"ok": false, "error": "injected failure"})
+                        } else {
+                            json!({"ok": true, "result": {"cancelled": true}})
+                        };
+                        socket.send(response.to_string().as_bytes(), 0).unwrap();
                     }
                 }
                 cancelled
@@ -671,9 +770,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|r| {
+                .flat_map(|r| {
                     assert_eq!(r["ec_transfer_params"]["consumer_zmq"], address);
-                    r["ec_transfer_params"]["ec_items"][0]["transfer_id"].clone()
+                    r["ec_transfer_params"]["ec_items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|entry| entry["transfer_id"].clone())
+                        .collect::<Vec<_>>()
                 })
                 .collect();
             if matches!(mode, "invalid" | "fail") {
@@ -682,7 +786,7 @@ mod tests {
                 let (_, mut pending) = result.unwrap();
                 if mode == "mixed" {
                     let pending = pending.as_mut().unwrap();
-                    assert_eq!(pending.transfer_ids.len(), 2);
+                    assert_eq!(pending.transfer_ids.len(), 1);
                     pending.disarm();
                 }
                 drop(pending);
@@ -693,7 +797,7 @@ mod tests {
                 && r["abandon"] == true
                 && ids.contains(&r["transfer_id"])));
             if mode == "mixed" {
-                assert!(cancelled[0].is_empty());
+                assert_eq!(cancelled[0][0]["transfer_id"], ids[0]);
             } else {
                 assert_ne!(
                     cancelled[0][0]["transfer_id"],
