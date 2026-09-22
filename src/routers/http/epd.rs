@@ -168,10 +168,15 @@ impl EncoderStage {
         let mut handles = Map::new();
         let mut transfers = Vec::new();
         let mut used_transfer_ids = Vec::new();
+        let mut rewritten = 0;
         for (item, mut reply) in items.iter().zip(replies) {
             let Some(Value::Object(mut params)) =
                 reply.get_mut("ec_transfer_params").map(Value::take)
             else {
+                // No EC report at all: keep the raw media but pin its uuid so
+                // the consumer derives the same mm_hash the encoder used.
+                body["messages"][item.message_index]["content"][item.content_index] =
+                    item.media.clone();
                 continue;
             };
             let entry = if let Some(reported) = params.remove(&item.content_id) {
@@ -182,6 +187,8 @@ impl EncoderStage {
                 None
             };
             let Some((hash, reported)) = entry else {
+                body["messages"][item.message_index]["content"][item.content_index] =
+                    item.media.clone();
                 continue;
             };
             if let Some(metadata) = reported
@@ -205,10 +212,23 @@ impl EncoderStage {
                     "transfer_id": item.transfer_id,
                 }));
                 used_transfer_ids.push(item.transfer_id.clone());
+                rewritten += 1;
+            } else {
+                // The encoder reported no placeholder metadata (e.g. a
+                // processor cache hit): keep the raw media with its uuid
+                // pinned and hand the transfer to the consumer, which can
+                // then reuse the published embedding after re-preprocessing
+                // instead of abandoning the transfer.
+                body["messages"][item.message_index]["content"][item.content_index] =
+                    item.media.clone();
+                transfers.push(json!({
+                    "mm_hash": hash,
+                    "transfer_id": item.transfer_id,
+                }));
+                used_transfer_ids.push(item.transfer_id.clone());
             }
             handles.insert(hash, reported);
         }
-        let rewritten = transfers.len();
         if !handles.is_empty() {
             if let Some(Value::Object(mut existing)) =
                 body.get_mut("ec_transfer_params").map(Value::take)
@@ -502,7 +522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_metadata_preserves_media_and_remote_handles() {
+    async fn missing_metadata_keeps_raw_media_with_uuid_and_forwards_transfers() {
         let (stage, seen, server) = mock("empty").await;
         let mut input = request();
         input["ec_transfer_params"] = json!({
@@ -513,17 +533,30 @@ mod tests {
             .prepare(&Client::new(), input.clone(), "pd", None, None)
             .await
             .unwrap();
-        assert_eq!(body["messages"], input["messages"]);
-        for key in ["opaque", "ec_items"] {
-            assert_eq!(
-                body["ec_transfer_params"][key],
-                input["ec_transfer_params"][key]
-            );
-        }
+        // Raw media is kept with the content-derived uuid pinned, so the
+        // consumer derives the same mm_hash and can reuse the embedding.
         let seen = seen.lock().unwrap();
         let uuid = seen[0]["messages"][0]["content"][0]["uuid"]
             .as_str()
-            .unwrap();
+            .unwrap()
+            .to_owned();
+        let content = &body["messages"][0]["content"];
+        for index in [0, 2] {
+            let mut expected = input["messages"][0]["content"][index].clone();
+            expected["uuid"] = json!(uuid);
+            assert_eq!(content[index], expected);
+        }
+        assert_eq!(content[1], input["messages"][0]["content"][1]);
+        assert_eq!(
+            body["ec_transfer_params"]["opaque"],
+            input["ec_transfer_params"]["opaque"]
+        );
+        // Raw-fallback transfers are forwarded to the consumer, not abandoned.
+        let transfers = body["ec_transfer_params"]["ec_items"].as_array().unwrap();
+        assert_eq!(transfers.len(), 3);
+        assert_eq!(transfers[0], input["ec_transfer_params"]["ec_items"][0]);
+        assert_eq!(transfers[1]["mm_hash"], format!("engine-{uuid}"));
+        assert_ne!(transfers[1]["transfer_id"], transfers[2]["transfer_id"]);
         let handle = &body["ec_transfer_params"][format!("engine-{uuid}")];
         assert_eq!(handle["metadata"], json!({}));
         assert_eq!(handle["peer_port"], 4321);
@@ -593,30 +626,35 @@ mod tests {
                     .each_ref()
                     .map(|a| a.rsplit_once(':').unwrap().1.parse::<u16>().unwrap());
                 send_address.send(addresses[0].clone()).unwrap();
-                let discovery: Value =
-                    serde_json::from_slice(&sockets[0].recv_bytes(0).unwrap()).unwrap();
-                assert_eq!(discovery, json!({"op": "peers"}));
-                sockets[0]
-                    .send(
-                        json!({"ok": true, "result": {"ports": ports}})
-                            .to_string()
-                            .as_bytes(),
-                        0,
-                    )
-                    .unwrap();
                 let mut cancelled = [Vec::new(), Vec::new()];
-                let expected = if mode == "mixed" { 1 } else { 2 };
-                for (rank, socket) in sockets.iter().enumerate() {
-                    for _ in 0..expected {
-                        let message: Value =
-                            serde_json::from_slice(&socket.recv_bytes(0).unwrap()).unwrap();
-                        cancelled[rank].push(message);
-                        let response = if mode == "cancel_error" && rank == 0 {
-                            json!({"ok": false, "error": "injected failure"})
-                        } else {
-                            json!({"ok": true, "result": {"cancelled": true}})
-                        };
-                        socket.send(response.to_string().as_bytes(), 0).unwrap();
+                // "mixed" consumes both transfers (one rewritten, one raw
+                // fallback) and is disarmed below, so nothing is abandoned
+                // and no control request is made at all.
+                let expected = if mode == "mixed" { 0 } else { 2 };
+                if expected > 0 {
+                    let discovery: Value =
+                        serde_json::from_slice(&sockets[0].recv_bytes(0).unwrap()).unwrap();
+                    assert_eq!(discovery, json!({"op": "peers"}));
+                    sockets[0]
+                        .send(
+                            json!({"ok": true, "result": {"ports": ports}})
+                                .to_string()
+                                .as_bytes(),
+                            0,
+                        )
+                        .unwrap();
+                    for (rank, socket) in sockets.iter().enumerate() {
+                        for _ in 0..expected {
+                            let message: Value =
+                                serde_json::from_slice(&socket.recv_bytes(0).unwrap()).unwrap();
+                            cancelled[rank].push(message);
+                            let response = if mode == "cancel_error" && rank == 0 {
+                                json!({"ok": false, "error": "injected failure"})
+                            } else {
+                                json!({"ok": true, "result": {"cancelled": true}})
+                            };
+                            socket.send(response.to_string().as_bytes(), 0).unwrap();
+                        }
                     }
                 }
                 cancelled
@@ -644,7 +682,7 @@ mod tests {
                 let (_, mut pending) = result.unwrap();
                 if mode == "mixed" {
                     let pending = pending.as_mut().unwrap();
-                    assert_eq!(pending.transfer_ids.len(), 1);
+                    assert_eq!(pending.transfer_ids.len(), 2);
                     pending.disarm();
                 }
                 drop(pending);
@@ -655,7 +693,7 @@ mod tests {
                 && r["abandon"] == true
                 && ids.contains(&r["transfer_id"])));
             if mode == "mixed" {
-                assert_eq!(cancelled[0][0]["transfer_id"], ids[0]);
+                assert!(cancelled[0].is_empty());
             } else {
                 assert_ne!(
                     cancelled[0][0]["transfer_id"],

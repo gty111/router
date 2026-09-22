@@ -33,8 +33,11 @@ are distributed round-robin per media item.
 
 Send ordinary OpenAI chat requests to `/v1/chat/completions`. Each raw media item
 is sent to an encoder. Published metadata replaces that item with an embeds
-reference; missing metadata preserves the original media for vLLM's fallback.
-Repeated images keep their original positions and independent transfer IDs.
+reference; when an encoder reports no metadata, the original media is kept with
+its content-derived uuid pinned and its transfer is forwarded, so the consumer
+re-preprocesses into the same mm_hash and can still reuse the published
+embedding. Repeated images keep their original positions and independent
+transfer IDs.
 Other request fields, including sampling options, pass through unchanged.
 Text-only and existing embeds inputs do not call the encoders. PD responses,
 including SSE streams, use the existing transparent forwarding path.
@@ -52,6 +55,9 @@ owns request completion/abort cleanup.
 - Regular E+PD or static vLLM E/P/D mode, DP=1, no IGW.
 - Keep the existing backend's TP/PP constraints; this does not add parallelism support.
 - Static E URLs; E health-aware routing and dynamic consumer discovery are not added.
+  The service registry has no encoder role, and vLLM does not publish EC control
+  addresses, so Mooncake PUSH cannot resolve a newly registered consumer. Dynamic
+  discovery for NIXL PULL or the example connector is a smaller follow-up.
 - JSON metadata only, not legacy tensor-base64 metadata from old E servers.
 - No early metadata publication, encoder batching changes, or engine/scheduler changes.
 - Image E2E validation is performed separately; do not infer audio/video coverage
