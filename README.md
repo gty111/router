@@ -9,6 +9,7 @@ A high-performance and light-weight request forwarding system for vLLM large sca
 
 - **Core Architecture**: Request routing framework and async processing patterns
 - **Load Balancing**: Multiple algorithms (cache-aware, power of two, consistent hashing, random, round robin)
+- **Program Scheduling**: Optional Program identity, RequestPool admission, Progress-TTL, and Global Queue placement for agent workloads
 - **Prefill-Decode Disaggregation**: Specialized routing for separated processing phases
 - **Service Discovery**: Kubernetes-native worker management and health monitoring
 - **Enterprise Features**: Circuit breakers, retry logic, metrics collection
@@ -79,6 +80,29 @@ vllm-router \
     --policy consistent_hash \
     --intra-node-data-parallel-size 8
 ```
+
+#### Optional WASM OnRequest middleware
+
+Load an independently built WASM Component plugin (see `examples/wasm_middleware/` and [RFC #236](https://github.com/vllm-project/router/issues/236)). By default it attaches only to `POST /v1/chat/completions` and fails closed on plugin errors:
+
+```bash
+./examples/wasm_middleware/build.sh
+
+./target/release/vllm-router \
+    --worker-urls http://localhost:8000 \
+    --wasm-middleware ./examples/wasm_middleware/wasm_middleware_example.component.wasm \
+    --wasm-middleware-route /v1/chat/completions
+```
+
+Additional paths can be attached with repeated `--wasm-middleware-route` flags (must be one of the protected inference routes). Without `--wasm-middleware`, the Router does not initialize Wasmtime.
+
+v0.1 resource / fail-closed defaults on attached routes (not configurable via CLI yet):
+
+- **Input body cap**: `min(10 MiB, --max-payload-size)`. Requests larger than this get **413** before the plugin runs, even if the plugin would only `Continue`. This is intentionally tighter than the Router's default 512 MiB payload limit.
+- **Execution deadline**: **100 ms** per invocation (Wasmtime epoch interruption). Deadline / trap failures fail closed with **500**.
+- **Queue full**: when the bounded worker queue is saturated, matching requests get **503**.
+
+Prometheus metrics for the WASM runtime are deferred to a later revision.
 
 #### Prefill-Decode Disaggregation
 ```bash
@@ -221,6 +245,8 @@ curl -X POST http://router:8000/v1/chat/completions \
 ```
 
 For detailed configuration options, hash key priorities, and usage examples, see [Load Balancing Documentation](docs/load_balancing/README.md).
+
+For the optional agent metadata contract, scheduling enablement, request-scoped hints, and engine KV-control boundary, see [Program Scheduling](docs/program_scheduling.md).
 
 ## Advanced Features
 
