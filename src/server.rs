@@ -941,7 +941,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     println!("DEBUG: Creating HTTP client");
     let client = Client::builder()
         .pool_idle_timeout(Some(Duration::from_secs(50)))
-        .pool_max_idle_per_host(500)
+        // Keep no idle connections: backends (e.g. uvicorn) close keep-alive
+        // connections after a few seconds, and reusing one races with that
+        // close, surfacing as sporadic transport-error 502s after idle gaps.
+        .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect_timeout(Duration::from_secs(10))
         .tcp_nodelay(true)
