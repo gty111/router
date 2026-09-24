@@ -568,6 +568,9 @@ pub enum ConnectionMode {
     #[default]
     #[serde(rename = "http")]
     Http,
+    /// vLLM rust Inference (`grpc://` / `grpcs://` worker URLs)
+    #[serde(rename = "grpc")]
+    Grpc,
 }
 
 /// Routing mode configuration
@@ -576,7 +579,7 @@ pub enum ConnectionMode {
 pub enum RoutingMode {
     #[serde(rename = "regular")]
     Regular {
-        /// List of worker URLs
+        /// Worker URLs: `http(s)://` or `grpc://`
         worker_urls: Vec<String>,
     },
     #[serde(rename = "openai")]
