@@ -2256,6 +2256,13 @@ impl RouterTrait for Router {
         {
             Ok(response) => {
                 let status = response.status();
+                // Keep the circuit breaker informed, as the typed path does:
+                // 2xx/4xx count as success, 5xx as worker failure.
+                let was_available = worker.is_available();
+                worker.record_outcome(status.is_success() || status.is_client_error());
+                if was_available != worker.is_available() {
+                    self.worker_registry.notify_worker_state_change();
+                }
                 if status.is_success() {
                     if let Some(transfers) = transfers.as_mut() {
                         transfers.disarm();
@@ -2364,6 +2371,12 @@ impl RouterTrait for Router {
             Err(error) => {
                 if let Some(completion) = &program_completion {
                     completion.finish(false);
+                }
+                // Transport failure: the worker never produced a response.
+                let was_available = worker.is_available();
+                worker.record_outcome(false);
+                if was_available != worker.is_available() {
+                    self.worker_registry.notify_worker_state_change();
                 }
                 (
                     StatusCode::BAD_GATEWAY,

@@ -1315,6 +1315,11 @@ impl VllmPDRouter {
             prefill_worker.decrement_load();
             let status = prefill_response.status();
             let detail = prefill_response.text().await.unwrap_or_default();
+            self.stop_profiling(&prefill_base_url).await;
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, duration);
             return Err(PDRouterError::NetworkError {
                 message: format!("Prefill server {prefill_url} returned {status}: {detail}"),
             });
@@ -1376,6 +1381,11 @@ impl VllmPDRouter {
             && !kv_transfer_params.as_ref().is_some_and(Value::is_object)
         {
             prefill_worker.decrement_load();
+            self.stop_profiling(&prefill_base_url).await;
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, duration);
             return Err(PDRouterError::NetworkError {
                 message:
                     "Prefill returned no KV transfer parameters; refusing metadata-only decode"
@@ -1635,7 +1645,10 @@ impl VllmPDRouter {
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
         let kv_connector = ctx.router_config.kv_connector;
-        let http_client = reqwest::Client::new();
+        // Carries the configured request/connect timeouts; a bare
+        // reqwest::Client::new() would let a stalled encoder hold the
+        // request and its concurrency permit indefinitely.
+        let http_client = ctx.client.clone();
 
         if let Some(ref addr) = discovery_address {
             // Discovery mode

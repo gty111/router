@@ -360,7 +360,15 @@ fn collect_media_items(body: &Value) -> Result<Vec<MediaItem>, EpdError> {
                         format!("{kind}.url must be a nonempty string"),
                     )
                 })?;
-            let content_id = format!("{:x}", Sha256::digest(url.as_bytes()));
+            // A caller-supplied uuid wins (matches the reference EPD proxy):
+            // it pins the EC cache identity, e.g. for retrying against an
+            // already published embedding. Hash the URL only as a fallback.
+            let content_id = item
+                .get("uuid")
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{:x}", Sha256::digest(url.as_bytes())));
             let transfer_id = Uuid::new_v4().simple().to_string();
             let mut media = item.clone();
             media["uuid"] = json!(content_id);
