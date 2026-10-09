@@ -283,6 +283,12 @@ struct CliArgs {
     #[arg(long, default_value_t = 1800)]
     request_timeout_secs: u64,
 
+    /// Idle timeout in seconds for pooled backend HTTP connections. Should be
+    /// lower than the backend's keep-alive timeout (vLLM defaults to 5s); 0
+    /// disables connection reuse entirely
+    #[arg(long, default_value_t = vllm_router_rs::server::DEFAULT_POOL_IDLE_TIMEOUT_SECS)]
+    pool_idle_timeout_secs: u64,
+
     /// Maximum number of concurrent requests allowed
     #[arg(long, default_value_t = 32768)]
     max_concurrent_requests: usize,
@@ -649,6 +655,7 @@ impl CliArgs {
             service_discovery_config,
             prometheus_config,
             request_timeout_secs: self.request_timeout_secs,
+            pool_idle_timeout_secs: self.pool_idle_timeout_secs,
             request_id_headers: if self.request_id_headers.is_empty() {
                 None
             } else {
