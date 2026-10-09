@@ -1288,31 +1288,10 @@ impl VllmPDRouter {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
 
-        if let Some((prefill_request, decode_request, request_id)) = self
-            .try_build_concurrent_requests(&original_request, &prefill_worker, &decode_worker, path)
-            .await
-        {
-            return self
-                .process_concurrent_two_stage(
-                    prefill_request,
-                    decode_request,
-                    prefill_worker,
-                    decode_worker,
-                    request_id,
-                    path,
-                    headers,
-                    start_time,
-                )
-                .await;
-        }
-
-        debug!(
-            "Prefill worker: {}, Decode worker: {}, Path: {}",
-            prefill_worker.url(),
-            decode_worker.url(),
-            path
-        );
-
+        // The encoder stage must run before the NIXL concurrent fast path:
+        // once a push identity is cached, try_build_concurrent_requests
+        // returns early, and multimodal requests reaching P/D without
+        // published embeddings break encoder-disaggregated workers.
         let (original_request, mut ec_transfers) = if path == "/v1/chat/completions" {
             if let Some(epd) = &self.epd {
                 match epd
@@ -1334,6 +1313,32 @@ impl VllmPDRouter {
         } else {
             (original_request, None)
         };
+
+        if let Some((prefill_request, decode_request, request_id)) = self
+            .try_build_concurrent_requests(&original_request, &prefill_worker, &decode_worker, path)
+            .await
+        {
+            return self
+                .process_concurrent_two_stage(
+                    prefill_request,
+                    decode_request,
+                    prefill_worker,
+                    decode_worker,
+                    request_id,
+                    path,
+                    headers,
+                    start_time,
+                    ec_transfers,
+                )
+                .await;
+        }
+
+        debug!(
+            "Prefill worker: {}, Decode worker: {}, Path: {}",
+            prefill_worker.url(),
+            decode_worker.url(),
+            path
+        );
 
         // Increment prefill load at the start of the prefill phase
         prefill_worker.increment_load();
@@ -1775,6 +1780,13 @@ impl VllmPDRouter {
             .ok()?;
 
         let mut decode_request = original_request.clone();
+        if self.epd.is_some() {
+            // D receives the prompt layout and KV, not P's EC reservations.
+            decode_request
+                .as_object_mut()
+                .unwrap()
+                .remove("ec_transfer_params");
+        }
         decode_request["kv_transfer_params"] =
             Self::build_nixl_push_decode_params(&identity, &request_id);
 
@@ -1792,6 +1804,7 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
         start_time: Instant,
+        mut ec_transfers: Option<super::epd::EcTransferGuard>,
     ) -> Result<Response, PDRouterError> {
         let prefill_base_url = prefill_worker.base_url().to_string();
         let prefill_dp_rank = prefill_worker.dp_rank();
@@ -1883,6 +1896,12 @@ impl VllmPDRouter {
         };
         if let Some(prefill_json) = prefill_response_json.as_ref() {
             self.maybe_cache_nixl_push_identity(&prefill_base_url, prefill_dp_rank, prefill_json);
+        }
+        // Prefill succeeded and consumed the embeddings; the pending EC
+        // transfers are now owned by the decode phase, so disarm the
+        // cancel-on-abandon guard.
+        if let Some(transfers) = ec_transfers.as_mut() {
+            transfers.disarm();
         }
 
         let decode_response = match decode_result {

@@ -2499,6 +2499,14 @@ impl RouterTrait for Router {
         };
         let url = worker.endpoint_url(path);
 
+        // Match the typed path's load accounting so cache-aware imbalance
+        // detection also sees transparent (EPD) traffic.
+        let load_tracked = policy.name() == "cache_aware" || program_completion.is_some();
+        if load_tracked {
+            worker.increment_load();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
+        }
+
         let (body, mut transfers) = if let Some(epd) = &self.epd {
             if *method == Method::POST && path == "/v1/chat/completions" {
                 match epd
@@ -2512,7 +2520,13 @@ impl RouterTrait for Router {
                     .await
                 {
                     Ok(value) => value,
-                    Err(error) => return error.into_response(),
+                    Err(error) => {
+                        if load_tracked {
+                            worker.decrement_load();
+                            RouterMetrics::set_running_requests(worker.url(), worker.load());
+                        }
+                        return error.into_response();
+                    }
                 }
             } else {
                 (body, None)
@@ -2532,6 +2546,10 @@ impl RouterTrait for Router {
             Method::PATCH => self.client.patch(&url),
             Method::HEAD => self.client.head(&url),
             _ => {
+                if load_tracked {
+                    worker.decrement_load();
+                    RouterMetrics::set_running_requests(worker.url(), worker.load());
+                }
                 return (
                     StatusCode::METHOD_NOT_ALLOWED,
                     format!("Method {} not supported", method),
@@ -2552,6 +2570,12 @@ impl RouterTrait for Router {
         if self.epd.is_some() {
             if let Some(headers) = headers {
                 for (name, value) in headers {
+                    // When a backend api_key is configured it must win:
+                    // RequestBuilder::header appends, and vLLM reads the
+                    // first Authorization value.
+                    if self.api_key.is_some() && name == http::header::AUTHORIZATION {
+                        continue;
+                    }
                     if !matches!(
                         name.as_str(),
                         "host"
@@ -2571,7 +2595,7 @@ impl RouterTrait for Router {
         }
 
         // Send request
-        match otel_http::send_client_request(
+        let response = match otel_http::send_client_request(
             request_builder,
             headers,
             ClientRequestOptions {
@@ -2698,6 +2722,10 @@ impl RouterTrait for Router {
                 }
             }
             Err(error) => {
+                if load_tracked {
+                    worker.decrement_load();
+                    RouterMetrics::set_running_requests(worker.url(), worker.load());
+                }
                 if let Some(completion) = &program_completion {
                     completion.finish(false);
                 }
@@ -2713,6 +2741,11 @@ impl RouterTrait for Router {
                 )
                     .into_response()
             }
+        };
+        if load_tracked {
+            hold_load_until_body_done(response, worker)
+        } else {
+            response
         }
     }
 }
