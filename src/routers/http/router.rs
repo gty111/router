@@ -2722,10 +2722,9 @@ impl RouterTrait for Router {
                 }
             }
             Err(error) => {
-                if load_tracked {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker.url(), worker.load());
-                }
+                // The 502 response below still flows through
+                // hold_load_until_body_done, which releases the load once
+                // its body finishes or is dropped — do not decrement here.
                 if let Some(completion) = &program_completion {
                     completion.finish(false);
                 }
