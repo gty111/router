@@ -194,7 +194,10 @@ impl EncoderStage {
         .await;
         let replies: Vec<Value> = replies.into_iter().collect::<Result<_, _>>()?;
         let mut handles = Map::new();
-        let mut transfers = Vec::new();
+        // (original media index, ec_items entry); encoder batches merge in
+        // group order, so entries must be re-sorted by media index before
+        // assembly to keep ec_items aligned with the request's media order.
+        let mut transfers: Vec<(usize, Value)> = Vec::new();
         let mut used_transfer_ids = Vec::new();
         let mut rewritten = 0;
         for ((_, indices), mut reply) in groups.iter().zip(replies) {
@@ -279,10 +282,13 @@ impl EncoderStage {
                         (kind): metadata,
                         "uuid": item.content_id,
                     });
-                    transfers.push(json!({
-                        "mm_hash": hash,
-                        "transfer_id": item.transfer_id,
-                    }));
+                    transfers.push((
+                        index,
+                        json!({
+                            "mm_hash": hash,
+                            "transfer_id": item.transfer_id,
+                        }),
+                    ));
                     used_transfer_ids.push(item.transfer_id.clone());
                     rewritten += 1;
                 } else {
@@ -293,15 +299,20 @@ impl EncoderStage {
                     // instead of abandoning the transfer.
                     body["messages"][item.message_index]["content"][item.content_index] =
                         item.media.clone();
-                    transfers.push(json!({
-                        "mm_hash": hash,
-                        "transfer_id": item.transfer_id,
-                    }));
+                    transfers.push((
+                        index,
+                        json!({
+                            "mm_hash": hash,
+                            "transfer_id": item.transfer_id,
+                        }),
+                    ));
                     used_transfer_ids.push(item.transfer_id.clone());
                 }
                 handles.insert(hash, reported);
             }
         }
+        transfers.sort_by_key(|(index, _)| *index);
+        let mut transfers: Vec<Value> = transfers.into_iter().map(|(_, entry)| entry).collect();
         if !handles.is_empty() {
             if let Some(Value::Object(mut existing)) =
                 body.get_mut("ec_transfer_params").map(Value::take)
@@ -629,6 +640,79 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert!(sent.iter().all(|part| part["uuid"].is_string()));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn ec_items_follow_media_order_across_encoders() {
+        // Images [A, B, A] round-robin onto two encoders: E0 gets [A, A]
+        // batched, E1 gets [B]. ec_items must stay in media order
+        // [A, B, A] so the consumer's positional transfer mapping cancels
+        // every reservation on request finish.
+        let spawn = || async {
+            let state = MockEncoder {
+                mode: "normal",
+                seen: Arc::new(Mutex::new(Vec::new())),
+            };
+            let seen = state.seen.clone();
+            let app = Router::new()
+                .route("/v1/chat/completions", post(encode))
+                .with_state(state);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (url, seen, server)
+        };
+        let (url0, seen0, server0) = spawn().await;
+        let (url1, seen1, server1) = spawn().await;
+        let stage = EncoderStage::new(EpdConfig {
+            encoder_urls: vec![url0, url1],
+            consumer_zmq_addrs: Default::default(),
+        });
+        let input = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,def"}},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                ],
+            }],
+        });
+        let (body, _) = stage
+            .prepare(&Client::new(), input, "pd", None, None)
+            .await
+            .unwrap();
+        // The split across two encoders actually happened.
+        assert_eq!(seen0.lock().unwrap().len(), 1);
+        assert_eq!(seen1.lock().unwrap().len(), 1);
+        assert_eq!(
+            seen0.lock().unwrap()[0]["messages"][0]["content"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let content = &body["messages"][0]["content"];
+        let uuid_a = content[0]["uuid"].as_str().unwrap();
+        let uuid_b = content[1]["uuid"].as_str().unwrap();
+        assert_ne!(uuid_a, uuid_b);
+        assert_eq!(content[2]["uuid"].as_str().unwrap(), uuid_a);
+        let hashes: Vec<String> = body["ec_transfer_params"]["ec_items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["mm_hash"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            hashes,
+            [
+                format!("engine-{uuid_a}"),
+                format!("engine-{uuid_b}"),
+                format!("engine-{uuid_a}"),
+            ]
+        );
+        server0.abort();
+        server1.abort();
     }
 
     #[tokio::test]
