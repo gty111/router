@@ -1287,6 +1287,13 @@ impl VllmPDRouter {
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
+        if !original_request.is_object() {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                "Request body must be a JSON object",
+            )
+                .into_response());
+        }
 
         // The encoder stage must run before the NIXL concurrent fast path:
         // once a push identity is cached, try_build_concurrent_requests
@@ -1457,12 +1464,25 @@ impl VllmPDRouter {
         if !prefill_response.status().is_success() {
             prefill_worker.decrement_load();
             let status = prefill_response.status();
+            let content_type = prefill_response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .cloned();
             let detail = prefill_response.text().await.unwrap_or_default();
             self.stop_profiling(&prefill_base_url).await;
             let duration = start_time.elapsed();
             RouterMetrics::record_pd_prefill_error(&prefill_base_url);
             RouterMetrics::record_pd_request(path);
             RouterMetrics::record_pd_request_duration(path, duration);
+            if status.is_client_error() {
+                let mut response = (status, detail).into_response();
+                if let Some(content_type) = content_type {
+                    response
+                        .headers_mut()
+                        .insert(http::header::CONTENT_TYPE, content_type);
+                }
+                return Ok(response);
+            }
             return Err(PDRouterError::NetworkError {
                 message: format!("Prefill server {prefill_url} returned {status}: {detail}"),
             });
@@ -1553,10 +1573,9 @@ impl VllmPDRouter {
         let mut decode_request = original_request.clone();
         if self.epd.is_some() {
             // D receives the prompt layout and KV, not P's EC reservations.
-            decode_request
-                .as_object_mut()
-                .unwrap()
-                .remove("ec_transfer_params");
+            if let Some(obj) = decode_request.as_object_mut() {
+                obj.remove("ec_transfer_params");
+            }
         }
         if let Some(params) = self
             .build_decode_kv_transfer_params(
@@ -1782,10 +1801,9 @@ impl VllmPDRouter {
         let mut decode_request = original_request.clone();
         if self.epd.is_some() {
             // D receives the prompt layout and KV, not P's EC reservations.
-            decode_request
-                .as_object_mut()
-                .unwrap()
-                .remove("ec_transfer_params");
+            if let Some(obj) = decode_request.as_object_mut() {
+                obj.remove("ec_transfer_params");
+            }
         }
         decode_request["kv_transfer_params"] =
             Self::build_nixl_push_decode_params(&identity, &request_id);
@@ -1871,6 +1889,18 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+                if resp.status().is_client_error() {
+                    let status = resp.status();
+                    let content_type = resp.headers().get(http::header::CONTENT_TYPE).cloned();
+                    let mut response =
+                        (status, resp.bytes().await.unwrap_or_default()).into_response();
+                    if let Some(content_type) = content_type {
+                        response
+                            .headers_mut()
+                            .insert(http::header::CONTENT_TYPE, content_type);
+                    }
+                    return Ok(response);
+                }
                 return Err(PDRouterError::NetworkError {
                     message: format!(
                         "Prefill request failed to {} with status {}",

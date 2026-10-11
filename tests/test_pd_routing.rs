@@ -45,6 +45,18 @@ mod test_pd_routing {
             Json(body): Json<Value>,
         ) -> axum::response::Response {
             seen.lock().unwrap().push(("P".into(), body.clone()));
+            if matches!(body["model"].as_str(), Some("prefill-400" | "prefill-422")) {
+                let status = if body["model"] == "prefill-400" {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                };
+                return (
+                    status,
+                    Json(json!({"error": "invalid sampling parameters"})),
+                )
+                    .into_response();
+            }
             if body["model"] == "fail" {
                 return (StatusCode::INTERNAL_SERVER_ERROR, "injected prefill error")
                     .into_response();
@@ -126,6 +138,8 @@ mod test_pd_routing {
             ("test", false, StatusCode::OK),
             ("test", true, StatusCode::OK),
             ("fail", false, StatusCode::INTERNAL_SERVER_ERROR),
+            ("prefill-400", false, StatusCode::BAD_REQUEST),
+            ("prefill-422", false, StatusCode::UNPROCESSABLE_ENTITY),
             ("missing-kv", false, StatusCode::INTERNAL_SERVER_ERROR),
             ("encoder-fail", false, StatusCode::SERVICE_UNAVAILABLE),
             ("bad-input", false, StatusCode::BAD_REQUEST),
@@ -156,11 +170,20 @@ mod test_pd_routing {
                 )
                 .await;
             assert_eq!(response.status(), status, "model={model}, stream={stream}");
+            if model.starts_with("prefill-") {
+                assert_eq!(response.headers()["content-type"], "application/json");
+            }
             let bytes = axum::body::to_bytes(response.into_body(), 4096)
                 .await
                 .unwrap();
             if stream {
                 assert!(String::from_utf8_lossy(&bytes).contains("[DONE]"));
+            }
+            if model.starts_with("prefill-") {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&bytes).unwrap(),
+                    json!({"error": "invalid sampling parameters"})
+                );
             }
             let seen = seen.lock().unwrap();
             let phases: Vec<_> = seen.iter().map(|(phase, _)| phase.as_str()).collect();
@@ -241,6 +264,13 @@ mod test_pd_routing {
             Json(body): Json<Value>,
         ) -> axum::response::Response {
             seen.lock().unwrap().push(("P".into(), body.clone()));
+            if body["model"] == "prefill-422" {
+                return (
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({"error": "invalid sampling parameters"})),
+                )
+                    .into_response();
+            }
             Json(json!({
                 "kv_transfer_params": {
                     "remote_engine_id": "P",
@@ -266,6 +296,8 @@ mod test_pd_routing {
             .route("/e/v1/chat/completions", post(encode))
             .route("/p/v1/chat/completions", post(prefill))
             .route("/d/v1/chat/completions", post(decode))
+            .route("/p/generate", post(prefill))
+            .route("/d/generate", post(decode))
             .with_state(seen.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -315,6 +347,15 @@ mod test_pd_routing {
             })
         };
 
+        // Invalid transparent bodies must be rejected before either PD path mutates them.
+        for body in [Value::Null, json!([]), json!("text"), json!(7)] {
+            let response = router
+                .route_transparent(None, "/generate", &axum::http::Method::POST, body)
+                .await;
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
+        assert!(seen.lock().unwrap().is_empty());
+
         // First request: no cached push identity, sequential path.
         let response = router
             .route_transparent(
@@ -348,20 +389,23 @@ mod test_pd_routing {
             .await;
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let _ = axum::body::to_bytes(response.into_body(), 4096).await;
-        let seen = seen.lock().unwrap();
-        let phases: Vec<_> = seen.iter().map(|(phase, _)| phase.as_str()).collect();
+        let seen_requests = seen.lock().unwrap().clone();
+        let phases: Vec<_> = seen_requests
+            .iter()
+            .map(|(phase, _)| phase.as_str())
+            .collect();
         // P and D are dispatched concurrently, so only their set is stable.
         assert_eq!(phases[0], "E");
         let mut pd: Vec<_> = phases[1..].to_vec();
         pd.sort_unstable();
         assert_eq!(pd, ["D", "P"]);
 
-        let p = &seen[1..]
+        let p = &seen_requests[1..]
             .iter()
             .find(|(phase, _)| phase == "P")
             .expect("prefill request")
             .1;
-        let d = &seen[1..]
+        let d = &seen_requests[1..]
             .iter()
             .find(|(phase, _)| phase == "D")
             .expect("decode request")
@@ -373,6 +417,37 @@ mod test_pd_routing {
         assert!(d.get("ec_transfer_params").is_none());
         assert_eq!(d["kv_transfer_params"]["do_remote_prefill"], true);
         assert_eq!(d["kv_transfer_params"]["remote_engine_id"], "P");
+
+        seen.lock().unwrap().clear();
+        for body in [Value::Null, json!([]), json!("text"), json!(7)] {
+            let response = router
+                .route_transparent(None, "/generate", &axum::http::Method::POST, body)
+                .await;
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
+        assert!(seen.lock().unwrap().is_empty());
+        let mut invalid = chat_body();
+        invalid["model"] = json!("prefill-422");
+        let response = router
+            .route_transparent(
+                None,
+                "/v1/chat/completions",
+                &axum::http::Method::POST,
+                invalid,
+            )
+            .await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            json!({"error": "invalid sampling parameters"})
+        );
         server.abort();
     }
 

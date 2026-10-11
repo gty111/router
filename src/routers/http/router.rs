@@ -2427,6 +2427,7 @@ impl RouterTrait for Router {
         body: serde_json::Value,
     ) -> Response {
         debug!("Transparent proxy: routing {} {} to backend", method, path);
+        let start = Instant::now();
 
         // Select a worker (filter by availability like select_worker_for_model)
         let all_workers = self.worker_registry.get_all();
@@ -2436,6 +2437,7 @@ impl RouterTrait for Router {
             .cloned()
             .collect();
         if workers.is_empty() {
+            RouterMetrics::record_request_error(path, "no_available_workers");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "No available workers".to_string(),
@@ -2468,7 +2470,10 @@ impl RouterTrait for Router {
                 .await
             {
                 Ok(completion) => completion,
-                Err(error) => return Self::schedule_error_response(error),
+                Err(error) => {
+                    RouterMetrics::record_request_error(path, "program_scheduling_error");
+                    return Self::schedule_error_response(error);
+                }
             }
         } else {
             None
@@ -2491,6 +2496,7 @@ impl RouterTrait for Router {
             if let Some(completion) = &program_completion {
                 completion.finish(false);
             }
+            RouterMetrics::record_request_error(path, "no_available_workers");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Failed to select the Program target".to_string(),
@@ -2521,6 +2527,7 @@ impl RouterTrait for Router {
                 {
                     Ok(value) => value,
                     Err(error) => {
+                        RouterMetrics::record_request_error(path, "encoder_error");
                         if load_tracked {
                             worker.decrement_load();
                             RouterMetrics::set_running_requests(worker.url(), worker.load());
@@ -2550,6 +2557,7 @@ impl RouterTrait for Router {
                     worker.decrement_load();
                     RouterMetrics::set_running_requests(worker.url(), worker.load());
                 }
+                RouterMetrics::record_request_error(path, "unsupported_method");
                 return (
                     StatusCode::METHOD_NOT_ALLOWED,
                     format!("Method {} not supported", method),
@@ -2741,6 +2749,12 @@ impl RouterTrait for Router {
                     .into_response()
             }
         };
+        if response.status().is_success() {
+            RouterMetrics::record_request(path);
+            RouterMetrics::record_generate_duration(start.elapsed());
+        } else {
+            RouterMetrics::record_request_error(path, "backend_error");
+        }
         if load_tracked {
             hold_load_until_body_done(response, worker)
         } else {
@@ -2959,6 +2973,73 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("mixed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn transparent_epd_records_request_metrics() {
+        use axum::{routing::post, Json};
+        use serde_json::{json, Value};
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                if body["fail"] == true {
+                    (StatusCode::BAD_REQUEST, "invalid request").into_response()
+                } else if body["stream"] == true {
+                    ([("content-type", "text/event-stream")], "data: [DONE]\n\n").into_response()
+                } else {
+                    Json(json!({"choices": []})).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router
+            .worker_registry
+            .register(Arc::new(BasicWorker::new(url, WorkerType::Regular)));
+        router.epd = Some(super::super::epd::EncoderStage::new(
+            crate::config::EpdConfig {
+                encoder_urls: vec!["http://unused".into()],
+                consumer_zmq_addrs: Default::default(),
+            },
+        ));
+        for (body, status) in [
+            (json!({"messages": []}), StatusCode::OK),
+            (json!({"messages": [], "stream": true}), StatusCode::OK),
+            (
+                json!({"messages": [], "fail": true}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (json!({"messages": null}), StatusCode::BAD_REQUEST),
+        ] {
+            let response = router
+                .route_transparent(None, "/v1/chat/completions", &Method::POST, body)
+                .await;
+            assert_eq!(response.status(), status);
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+        }
+        let exported = handle.render();
+        assert!(exported.contains("vllm_router_requests_total{route=\"/v1/chat/completions\"} 2"));
+        assert!(exported.contains("vllm_router_generate_duration_seconds_count 2"));
+        for error in ["encoder_error", "backend_error"] {
+            assert!(
+                exported
+                    .lines()
+                    .any(|line| line.starts_with("vllm_router_request_errors_total{")
+                        && line.contains(&format!("error_type=\"{error}\""))
+                        && line.ends_with(" 1")),
+                "{exported}"
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]

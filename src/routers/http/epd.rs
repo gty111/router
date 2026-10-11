@@ -128,6 +128,28 @@ impl EncoderStage {
         if items.is_empty() {
             return Ok((body, None));
         }
+        let mut embed_positions = Vec::new();
+        for (message_index, message) in body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            for (content_index, item) in message
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("image_embeds" | "audio_embeds" | "video_embeds")
+                ) {
+                    embed_positions.push((message_index, content_index));
+                }
+            }
+        }
         let consumer_addr = self.config.consumer_zmq_addrs.get(consumer_url);
         if !self.config.consumer_zmq_addrs.is_empty() && consumer_addr.is_none() {
             return Err((
@@ -194,10 +216,8 @@ impl EncoderStage {
         .await;
         let replies: Vec<Value> = replies.into_iter().collect::<Result<_, _>>()?;
         let mut handles = Map::new();
-        // (original media index, ec_items entry); encoder batches merge in
-        // group order, so entries must be re-sorted by media index before
-        // assembly to keep ec_items aligned with the request's media order.
-        let mut transfers: Vec<(usize, Value)> = Vec::new();
+        // Sort transfers by content position, including caller-supplied embeds.
+        let mut transfers = Vec::new();
         let mut used_transfer_ids = Vec::new();
         let mut rewritten = 0;
         for ((_, indices), mut reply) in groups.iter().zip(replies) {
@@ -283,7 +303,7 @@ impl EncoderStage {
                         "uuid": item.content_id,
                     });
                     transfers.push((
-                        index,
+                        (item.message_index, item.content_index),
                         json!({
                             "mm_hash": hash,
                             "transfer_id": item.transfer_id,
@@ -300,7 +320,7 @@ impl EncoderStage {
                     body["messages"][item.message_index]["content"][item.content_index] =
                         item.media.clone();
                     transfers.push((
-                        index,
+                        (item.message_index, item.content_index),
                         json!({
                             "mm_hash": hash,
                             "transfer_id": item.transfer_id,
@@ -311,23 +331,24 @@ impl EncoderStage {
                 handles.insert(hash, reported);
             }
         }
-        transfers.sort_by_key(|(index, _)| *index);
-        let mut transfers: Vec<Value> = transfers.into_iter().map(|(_, entry)| entry).collect();
         if !handles.is_empty() {
+            let mut previous = Vec::new();
             if let Some(Value::Object(mut existing)) =
                 body.get_mut("ec_transfer_params").map(Value::take)
             {
-                if !transfers.is_empty() {
-                    if let Some(Value::Array(mut previous)) = existing.remove("ec_items") {
-                        previous.append(&mut transfers);
-                        transfers = previous;
-                    }
+                if let Some(Value::Array(entries)) = existing.remove("ec_items") {
+                    previous = entries;
                 }
                 existing.extend(handles);
                 handles = existing;
             }
-            if !transfers.is_empty() {
-                handles.insert("ec_items".into(), Value::Array(transfers));
+            if previous.len() == embed_positions.len() {
+                transfers.extend(embed_positions.into_iter().zip(previous.drain(..)));
+            }
+            transfers.sort_by_key(|(position, _)| *position);
+            previous.extend(transfers.into_iter().map(|(_, entry)| entry));
+            if !previous.is_empty() {
+                handles.insert("ec_items".into(), Value::Array(previous));
             }
             body["ec_transfer_params"] = Value::Object(handles);
         }
@@ -713,6 +734,39 @@ mod tests {
         );
         server0.abort();
         server1.abort();
+    }
+
+    #[tokio::test]
+    async fn existing_and_new_transfers_follow_content_order() {
+        let (stage, _, server) = mock("normal").await;
+        let embed = json!({
+            "type": "image_embeds",
+            "image_embeds": {"image_grid_thw": [1, 2, 3]},
+            "uuid": "cached",
+        });
+        let raw = json!({"type": "image_url", "image_url": {"url": "new-image"}});
+        let cached = json!({"mm_hash": "cached-hash", "transfer_id": "cached-transfer"});
+        for content in [json!([raw, embed]), json!([embed, raw])] {
+            let raw_index = usize::from(content[0]["type"] == "image_embeds");
+            let input = json!({
+                "messages": [{"role": "user", "content": content}],
+                "ec_transfer_params": {
+                    "cached-hash": {"peer_port": 42},
+                    "ec_items": [cached],
+                },
+            });
+            let (body, _) = stage
+                .prepare(&Client::new(), input, "pd", None, None)
+                .await
+                .unwrap();
+            let transfers = body["ec_transfer_params"]["ec_items"].as_array().unwrap();
+            assert_eq!(transfers.len(), 2);
+            assert_eq!(transfers[1 - raw_index], cached);
+            assert_ne!(transfers[raw_index]["transfer_id"], cached["transfer_id"]);
+            assert_eq!(body["messages"][0]["content"][1 - raw_index], embed);
+            assert_eq!(body["ec_transfer_params"]["cached-hash"]["peer_port"], 42);
+        }
+        server.abort();
     }
 
     #[tokio::test]
