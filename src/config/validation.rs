@@ -211,6 +211,15 @@ impl ConfigValidator {
             });
         }
         Self::validate_urls(&epd.encoder_urls)?;
+        for url in epd.encoder_urls.iter().chain(worker_urls.iter().copied()) {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ConfigError::InvalidValue {
+                    field: "epd.worker_url".into(),
+                    value: url.clone(),
+                    reason: "EPD requires HTTP(S) encoder and consumer URLs".into(),
+                });
+            }
+        }
         if !epd.consumer_zmq_addrs.is_empty() {
             if worker_urls.is_empty()
                 || epd.consumer_zmq_addrs.len() != worker_urls.len()
@@ -933,6 +942,48 @@ mod tests {
         );
 
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_epd_requires_http_workers() {
+        for (encoder_scheme, consumer_scheme, supported) in [
+            ("http", "http", true),
+            ("https", "https", true),
+            ("grpc", "http", false),
+            ("http", "grpc", false),
+        ] {
+            let consumer = format!("{consumer_scheme}://consumer:8000");
+            for mode in [
+                RoutingMode::Regular {
+                    worker_urls: vec![consumer.clone()],
+                },
+                RoutingMode::VllmPrefillDecode {
+                    prefill_urls: vec![(consumer.clone(), None)],
+                    decode_urls: vec![format!("{consumer_scheme}://decode:8000")],
+                    prefill_policy: None,
+                    decode_policy: None,
+                    discovery_address: None,
+                },
+            ] {
+                let mut config = RouterConfig::new(mode, PolicyConfig::Random);
+                config.epd = Some(EpdConfig {
+                    encoder_urls: vec![format!("{encoder_scheme}://encoder:8000")],
+                    consumer_zmq_addrs: Default::default(),
+                });
+                let result = ConfigValidator::validate(&config);
+                if supported {
+                    result.unwrap();
+                } else {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("EPD requires HTTP(S)"),
+                        "encoder={encoder_scheme}, consumer={consumer_scheme}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

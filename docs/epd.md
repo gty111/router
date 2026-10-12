@@ -54,6 +54,7 @@ owns request completion/abort cleanup.
 
 - Native binary CLI only; the Python launcher does not expose `--epd-config` yet.
 - Regular E+PD or static vLLM E/P/D mode, DP=1, no IGW.
+- HTTP(S) backends only; gRPC encoder and consumer URLs are rejected at startup.
 - Keep the existing backend's TP/PP constraints; this does not add parallelism support.
 - Static E URLs; E health-aware routing and dynamic consumer discovery are not added.
   The service registry has no encoder role, and vLLM does not publish EC control
